@@ -24,9 +24,6 @@ OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
 using namespace nvinfer1;
 
-static constexpr int kInputW = 640;
-static constexpr int kInputH = 640;
-
 struct Detection { float x1, y1, x2, y2, conf; int cls; };
 
 struct TRTLogger : ILogger {
@@ -36,25 +33,38 @@ struct TRTLogger : ILogger {
 };
 static TRTLogger gLogger;
 
-// NVRTC kernel: GPU BGRA8 → FP32 CHW
+// NVRTC kernel: GPU BGRA8 → FP32 CHW (parameterized by kernel args, not constants)
 static const char *kKernelSrc = R"(
 extern "C" __global__ void bgra_to_fp32_chw(
     const unsigned char *__restrict__ bgra, int texW, int texH,
-    float *__restrict__ output, int cropX, int cropY)
+    float *__restrict__ output, int outW, int outH, int cropX, int cropY)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= 640 || y >= 640) return;
+    if (x >= outW || y >= outH) return;
     int srcX = cropX + x;
     int srcY = cropY + y;
     int srcIdx = (srcY * texW + srcX) * 4;
-    int dstIdx = y * 640 + x;
-    int base = 640 * 640;
+    int dstIdx = y * outW + x;
+    int base = outW * outH;
     output[0 * base + dstIdx] = (float)bgra[srcIdx + 2] / 255.0f;
     output[1 * base + dstIdx] = (float)bgra[srcIdx + 1] / 255.0f;
     output[2 * base + dstIdx] = (float)bgra[srcIdx + 0] / 255.0f;
 }
 )";
+
+// Available games
+struct GameEntry {
+    const char *name, *path;
+    bool headPriority = true;
+    int headClass = 1, bodyClass = 0;
+    int modelW = 640, modelH = 640;
+    int targetClass = -1; // >=0 = only aim at this class (ignores headPriority)
+};
+static const GameEntry kGames[] = {
+    {"Valorant (640)",    "D:/code/obs-plugintemplate/data/weights/valorant640.engine",   true,  1, 0, 640, 640, -1},
+    {"BF6 diwo (416)",    "D:/code/obs-plugintemplate/data/weights/bf6_diwo_416.engine",  false, 0, -1, 416, 416, 0},
+};
 
 struct filter_data {
     obs_source_t *context;
@@ -90,7 +100,9 @@ struct filter_data {
     std::string pendingEnginePath;
     bool engineSwapNeeded = false;
 
-    // Game-specific class mapping (head/body)
+    // Game-specific config (set on engine load from kGames)
+    int modelW = 640, modelH = 640;
+    int targetClass = -1; // >=0 = only aim this class
     bool headPriority = true;
     int headClass = 1;
     int bodyClass = 0;
@@ -106,19 +118,6 @@ struct filter_data {
 
     std::vector<Detection> detections;
     int tickCount = 0, inferCount = 0;
-};
-
-// Available games — add new entries here
-struct GameEntry {
-    const char *name;
-    const char *path;
-    bool headPriority = true; // true=prefer head→body, false=any target upper 20%
-    int headClass = 1;
-    int bodyClass = 0;
-};
-static const GameEntry kGames[] = {
-    {"Valorant", "D:/code/obs-plugintemplate/data/weights/valorant.engine", true,  1, 0},
-    {"BF6",      "D:/code/obs-plugintemplate/data/weights/bf6.engine",      false, 0, -1},
 };
 
 // ----------------------------------------------------------------
@@ -205,7 +204,7 @@ static bool loadEngine(filter_data *f, const char *enginePath) {
             f->execCtx->setOutputTensorAddress(name, f->trtBindings[i]);
         }
     }
-    cudaMalloc(&f->d_bgra, kInputW * kInputH * 4);
+    cudaMalloc(&f->d_bgra, f->modelW * f->modelH * 4);
     f->currentEnginePath = enginePath;
     blog(LOG_INFO, "[YOLO] Engine loaded: %s", enginePath);
     return true;
@@ -240,6 +239,11 @@ static void *filter_create(obs_data_t *settings, obs_source_t *context) {
             f->headPriority = g.headPriority;
             f->headClass = g.headClass;
             f->bodyClass = g.bodyClass;
+            f->modelW = g.modelW;
+            f->modelH = g.modelH;
+            f->targetClass = g.targetClass;
+            blog(LOG_INFO, "[YOLO] Config: %s %dx%d headPri=%d targetCls=%d",
+                 g.name, f->modelW, f->modelH, f->headPriority, f->targetClass);
             break;
         }
     }
@@ -278,11 +282,14 @@ static void filter_update(void *data, obs_data_t *settings) {
                 f->headPriority = g.headPriority;
                 f->headClass = g.headClass;
                 f->bodyClass = g.bodyClass;
+                f->modelW = g.modelW;
+                f->modelH = g.modelH;
+                f->targetClass = g.targetClass;
                 break;
             }
         }
-        blog(LOG_INFO, "[YOLO] Engine switch: %s (headPri=%d head=%d body=%d)",
-             newPath, f->headPriority, f->headClass, f->bodyClass);
+        blog(LOG_INFO, "[YOLO] Engine switch: %s (%dx%d headPri=%d targetCls=%d)",
+             newPath, f->modelW, f->modelH, f->headPriority, f->targetClass);
     }
 
     // Lazy-load mouse DLL when aim assist is first enabled
@@ -305,10 +312,9 @@ static void filter_update(void *data, obs_data_t *settings) {
 // ----------------------------------------------------------------
 static std::vector<Detection> postprocess(const float *output, int texW, int texH,
                                            int cropW, int cropH,
-                                           int cropX, int cropY, float confThr) {
+                                           int cropX, int cropY, int modelW, float confThr) {
     std::vector<Detection> dets;
-    // Scale from model 640 coords → crop region coords, then offset to full frame
-    float s = (float)cropW / (float)kInputW;
+    float s = (float)cropW / (float)modelW;
     for (int i = 0; i < 300; i++) {
         float x1 = output[i*6+0], y1 = output[i*6+1];
         float x2 = output[i*6+2], y2 = output[i*6+3];
@@ -337,10 +343,12 @@ static void filter_video_render(void *data, gs_effect_t *effect) {
     obs_source_process_filter_begin(f->context, GS_BGRA, OBS_ALLOW_DIRECT_RENDERING);
     obs_source_process_filter_end(f->context, obs_get_base_effect(OBS_EFFECT_DEFAULT), 0, 0);
 
-    // Hot-swap engine if pending
+    // Hot-swap engine if pending (also rebuild interop for new model size)
     if (f->engineSwapNeeded && !f->pendingEnginePath.empty()) {
         cudaSetDevice(0); cudaFree(0);
         destroyTRT(f);
+        if (f->cudaRes) { cudaGraphicsUnregisterResource(f->cudaRes); f->cudaRes = nullptr; }
+        if (f->sharedTex) { f->sharedTex->Release(); f->sharedTex = nullptr; }
         if (!loadEngine(f, f->pendingEnginePath.c_str())) {
             blog(LOG_WARNING, "[YOLO] Engine swap FAILED: %s", f->pendingEnginePath.c_str());
             f->engineLoaded = false;
@@ -356,38 +364,36 @@ static void filter_video_render(void *data, gs_effect_t *effect) {
     uint32_t h = obs_source_get_height(parent);
     if (w == 0 || h == 0) return;
 
-    int cw = std::min(kInputW, (int)w), ch = std::min(kInputH, (int)h);
+    int mw = f->modelW, mh = f->modelH;
+    int cw = std::min(mw, (int)w), ch = std::min(mh, (int)h);
     int cx = ((int)w - cw) / 2, cy = ((int)h - ch) / 2;
 
-    // Step 2: Render parent to 640x640 texrender with center crop ortho
-    // This PREVENTS stretching — only the center 640x640 region maps to the texrender
+    // Step 2: Render parent to model-sized texrender with center crop ortho
     gs_texrender_reset(f->texrender);
     gs_blend_state_push();
     gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
     struct vec4 cl; vec4_zero(&cl);
 
-    if (gs_texrender_begin(f->texrender, kInputW, kInputH)) {
+    if (gs_texrender_begin(f->texrender, mw, mh)) {
         gs_clear(GS_CLEAR_COLOR, &cl, 0.0f, 0);
-        // Center crop: maps parent coords (cx..cx+640, cy..cy+640) → texrender (0..640, 0..640)
-        gs_ortho((float)cx, (float)(cx + kInputW),
-                 (float)cy, (float)(cy + kInputH), -1.0f, 1.0f);
+        gs_ortho((float)cx, (float)(cx + mw),
+                 (float)cy, (float)(cy + mh), -1.0f, 1.0f);
         gs_matrix_identity();
         obs_source_video_render(parent);
         gs_texrender_end(f->texrender);
     }
     gs_blend_state_pop();
 
-    // Step 3: Get texrender's D3D11 texture, create our shared tex, CopyResource
+    // Step 3: D3D11 shared texture for CUDA interop (model-sized)
     gs_texture_t *gsTex = gs_texrender_get_texture(f->texrender);
     if (!gsTex) return;
     ID3D11Texture2D *srcTex = (ID3D11Texture2D *)gs_texture_get_obj(gsTex);
     if (!srcTex) return;
 
-    // Lazy-create shared texture
     if (!f->sharedTex) {
         ID3D11Device *d3dDev = (ID3D11Device *)gs_get_device_obj();
         D3D11_TEXTURE2D_DESC desc = {};
-        desc.Width = kInputW; desc.Height = kInputH;
+        desc.Width = mw; desc.Height = mh;
         desc.MipLevels = 1; desc.ArraySize = 1;
         desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         desc.SampleDesc.Count = 1;
@@ -426,12 +432,11 @@ static void filter_video_render(void *data, gs_effect_t *effect) {
     cudaArray_t arr = nullptr;
     cudaGraphicsSubResourceGetMappedArray(&arr, f->cudaRes, 0, 0);
 
-    // GPU copy: 640x640 BGRA from CUDA array → d_bgra
-    ce = cudaMemcpy2DFromArrayAsync(f->d_bgra, kInputW * 4, arr, 0, 0,
-                                     kInputW * 4, kInputH,
+    // GPU copy: model BGRA from CUDA array → d_bgra
+    ce = cudaMemcpy2DFromArrayAsync(f->d_bgra, mw * 4, arr, 0, 0,
+                                     mw * 4, mh,
                                      cudaMemcpyDeviceToDevice);
     cudaGraphicsUnmapResources(1, &f->cudaRes);
-
     if (ce != cudaSuccess) {
         blog(LOG_WARNING, "[YOLO] memcpy fail: %s", cudaGetErrorString(ce)); return;
     }
@@ -443,9 +448,10 @@ static void filter_video_render(void *data, gs_effect_t *effect) {
 
     // Launch NVRTC FP32 preprocess kernel
     {
-        int texW = kInputW, texH = kInputH, c0 = 0;
-        void *args[] = { &f->d_bgra, &texW, &texH, &f->d_input, &c0, &c0 };
-        dim3 block(32, 8), grid(20, 80);
+        int c0 = 0;
+        void *args[] = { &f->d_bgra, &mw, &mh, &f->d_input, &mw, &mh, &c0, &c0 };
+        dim3 block(32, 8);
+        dim3 grid((mw + 31) / 32, (mh + 7) / 8);
         cuLaunchKernel(f->cuKernel, grid.x, grid.y, 1,
                        block.x, block.y, 1, 0, nullptr, args, nullptr);
     }
@@ -466,7 +472,7 @@ static void filter_video_render(void *data, gs_effect_t *effect) {
     cudaMemcpy(output.data(), f->d_output, f->outputBytes, cudaMemcpyDeviceToHost);
 
     // Step 7: Postprocess
-    f->detections = postprocess(output.data(), w, h, cw, ch, cx, cy, f->confThreshold);
+    f->detections = postprocess(output.data(), w, h, cw, ch, cx, cy, f->modelW, f->confThreshold);
     f->inferCount++;
 
     if (f->inferCount % 120 == 1)
@@ -495,8 +501,19 @@ static void filter_video_render(void *data, gs_effect_t *effect) {
                 aimY = body->y1 + (body->y2 - body->y1) * 0.10f;
                 target = body; what = "body->head";
             }
+        } else if (f->targetClass >= 0) {
+            // Single-class mode: only aim at targetClass, upper 20% of box
+            for (const auto &d : f->detections) {
+                if (d.cls == f->targetClass && (!target || d.conf > target->conf))
+                    target = &d;
+            }
+            if (target) {
+                aimX = (target->x1 + target->x2) * 0.5f;
+                aimY = target->y1 + (target->y2 - target->y1) * 0.10f;
+                what = "enemy";
+            }
         } else {
-            // BF6 mode: any class, aim at upper 20% of bounding box
+            // Any-class mode: any detection, aim at upper 20%
             for (const auto &d : f->detections) {
                 if (!target || d.conf > target->conf) target = &d;
             }

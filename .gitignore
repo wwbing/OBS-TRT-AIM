@@ -1,0 +1,46 @@
+# Build output
+build_*/
+build_x64/
+RelWithDebInfo/
+Release/
+Debug/
+*.dir/
+
+# Dependencies (downloaded by buildspec)
+.deps/
+
+# IDE
+.vs/
+.vscode/
+.claude/
+*.vcxproj*
+*.sln*
+*.user
+CMakeSettings.json
+
+# Object files & libs
+*.obj
+*.o
+*.lib
+*.exp
+*.ilk
+*.pdb
+
+# Plugin output
+*.dll
+!obs-plugins/
+
+# Debug dump images
+data/debug_frame_*.jpg
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+_deps/

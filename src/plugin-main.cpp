@@ -14,6 +14,7 @@
 #include "mouse_controller.h"
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -84,16 +85,40 @@ struct filter_data {
     float confThreshold = 0.25f;
     bool engineLoaded = false;
 
+    // Dynamic engine switching
+    std::string currentEnginePath;
+    std::string pendingEnginePath;
+    bool engineSwapNeeded = false;
+
+    // Game-specific class mapping (head/body)
+    bool headPriority = true;
+    int headClass = 1;
+    int bodyClass = 0;
+
     // Mouse aim assist
     MouseController mouse;
     bool aimAssistEnabled = false;
-    float aimSensitivity = 1.0f;
+    float aimSensitivity = 0.15f;
+    float aimRange = 500.0f;
 
     cudaEvent_t evStart = nullptr, evStop = nullptr;
     float gpuLatencyMs = 0.0f;
 
     std::vector<Detection> detections;
     int tickCount = 0, inferCount = 0;
+};
+
+// Available games — add new entries here
+struct GameEntry {
+    const char *name;
+    const char *path;
+    bool headPriority = true; // true=prefer head→body, false=any target upper 20%
+    int headClass = 1;
+    int bodyClass = 0;
+};
+static const GameEntry kGames[] = {
+    {"Valorant", "D:/code/obs-plugintemplate/data/weights/valorant.engine", true,  1, 0},
+    {"BF6",      "D:/code/obs-plugintemplate/data/weights/bf6.engine",      false, 0, -1},
 };
 
 // ----------------------------------------------------------------
@@ -136,7 +161,19 @@ static std::vector<char> loadEngineFile(const std::string &path) {
     return data;
 }
 
-static bool initTRT(filter_data *f, const char *enginePath) {
+// Destroy TRT resources only (keep NVRTC, texrender, interop, cudaRes)
+static void destroyTRT(filter_data *f) {
+    for (void *ptr : f->trtBindings) { if (ptr) cudaFree(ptr); }
+    f->trtBindings.clear();
+    cudaFree(f->d_bgra); f->d_bgra = nullptr;
+    delete f->execCtx; f->execCtx = nullptr;
+    delete f->engine; f->engine = nullptr;
+    delete f->runtime; f->runtime = nullptr;
+    f->d_input = nullptr; f->d_output = nullptr; f->outputBytes = 0;
+}
+
+// Allocate TRT bindings dynamically (call after destroyTRT, on render thread)
+static bool loadEngine(filter_data *f, const char *enginePath) {
     auto data = loadEngineFile(enginePath);
     if (data.empty()) return false;
     f->runtime = createInferRuntime(gLogger);
@@ -145,27 +182,20 @@ static bool initTRT(filter_data *f, const char *enginePath) {
 
     int nb = f->engine->getNbIOTensors();
     f->trtBindings.resize(nb, nullptr);
-
     for (int i = 0; i < nb; i++) {
         const char *name = f->engine->getIOTensorName(i);
         Dims dims = f->engine->getTensorShape(name);
         DataType dt = f->engine->getTensorDataType(name);
         TensorIOMode mode = f->engine->getTensorIOMode(name);
-
         size_t vol = 1;
-        for (int d = 0; d < dims.nbDims; d++)
-            vol *= (dims.d[d] > 0 ? dims.d[d] : 1);
+        for (int d = 0; d < dims.nbDims; d++) vol *= (dims.d[d] > 0 ? dims.d[d] : 1);
         size_t bytes = vol * ((dt == DataType::kFLOAT) ? 4 : 2);
-
         blog(LOG_INFO, "[YOLO] IO[%d] '%s': dims=%s type=%s mode=%s vol=%zu bytes=%zu",
              i, name,
-             [&]() { std::string s; for(int d=0;d<dims.nbDims;d++){if(d)s+="x";s+=std::to_string(dims.d[d]);} return s; }().c_str(),
-             (dt == DataType::kFLOAT) ? "FP32" : "FP16",
-             (mode == TensorIOMode::kINPUT) ? "IN" : "OUT",
-             vol, bytes);
-
+             [&](){std::string s;for(int d=0;d<dims.nbDims;d++){if(d)s+="x";s+=std::to_string(dims.d[d]);}return s;}().c_str(),
+             (dt==DataType::kFLOAT)?"FP32":"FP16",
+             (mode==TensorIOMode::kINPUT)?"IN":"OUT", vol, bytes);
         cudaMalloc(&f->trtBindings[i], bytes);
-
         if (mode == TensorIOMode::kINPUT) {
             f->d_input = f->trtBindings[i];
             f->execCtx->setInputTensorAddress(name, f->trtBindings[i]);
@@ -175,16 +205,20 @@ static bool initTRT(filter_data *f, const char *enginePath) {
             f->execCtx->setOutputTensorAddress(name, f->trtBindings[i]);
         }
     }
-
     cudaMalloc(&f->d_bgra, kInputW * kInputH * 4);
+    f->currentEnginePath = enginePath;
+    blog(LOG_INFO, "[YOLO] Engine loaded: %s", enginePath);
+    return true;
+}
+
+static bool initTRT(filter_data *f, const char *enginePath) {
     cudaEventCreate(&f->evStart);
     cudaEventCreate(&f->evStop);
-
     obs_enter_graphics();
     f->texrender = gs_texrender_create(GS_BGRA, GS_ZS_NONE);
     obs_leave_graphics();
-
     if (!compileKernel(f)) return false;
+    if (!loadEngine(f, enginePath)) return false;
     blog(LOG_INFO, "[YOLO] TRT + NVRTC ready (FP32, dynamic bindings)");
     return true;
 }
@@ -200,6 +234,15 @@ static void *filter_create(obs_data_t *settings, obs_source_t *context) {
     blog(LOG_INFO, "[YOLO] create: engine=%s conf=%.2f",
          path ? path : "(null)", f->confThreshold);
     if (path && *path && initTRT(f, path)) f->engineLoaded = true;
+    // Set initial class mapping from default game
+    for (const auto &g : kGames) {
+        if (strcmp(g.path, path) == 0) {
+            f->headPriority = g.headPriority;
+            f->headClass = g.headClass;
+            f->bodyClass = g.bodyClass;
+            break;
+        }
+    }
     return f;
 }
 
@@ -212,9 +255,7 @@ static void filter_destroy(void *data) {
     if (f->texrender) gs_texrender_destroy(f->texrender);
     obs_leave_graphics();
     cudaEventDestroy(f->evStart); cudaEventDestroy(f->evStop);
-    for (void *ptr : f->trtBindings) { if (ptr) cudaFree(ptr); }
-    cudaFree(f->d_bgra);
-    delete f->execCtx; delete f->engine; delete f->runtime;
+    destroyTRT(f);
     blog(LOG_INFO, "[YOLO] destroy (infer=%d)", f->inferCount);
     delete f;
 }
@@ -224,6 +265,25 @@ static void filter_update(void *data, obs_data_t *settings) {
     f->confThreshold = (float)obs_data_get_double(settings, "conf_threshold");
     f->aimAssistEnabled = obs_data_get_bool(settings, "aim_assist");
     f->aimSensitivity = (float)obs_data_get_double(settings, "aim_sensitivity");
+    f->aimRange = (float)obs_data_get_double(settings, "aim_range");
+
+    // Check for game engine switch
+    const char *newPath = obs_data_get_string(settings, "engine_path");
+    if (newPath && *newPath && f->currentEnginePath != newPath) {
+        f->pendingEnginePath = newPath;
+        f->engineSwapNeeded = true;
+        // Look up class mapping for this game
+        for (const auto &g : kGames) {
+            if (strcmp(g.path, newPath) == 0) {
+                f->headPriority = g.headPriority;
+                f->headClass = g.headClass;
+                f->bodyClass = g.bodyClass;
+                break;
+            }
+        }
+        blog(LOG_INFO, "[YOLO] Engine switch: %s (headPri=%d head=%d body=%d)",
+             newPath, f->headPriority, f->headClass, f->bodyClass);
+    }
 
     // Lazy-load mouse DLL when aim assist is first enabled
     if (f->aimAssistEnabled && !f->mouse.IsLoaded()) {
@@ -276,6 +336,18 @@ static void filter_video_render(void *data, gs_effect_t *effect) {
     // Step 1: Render original source
     obs_source_process_filter_begin(f->context, GS_BGRA, OBS_ALLOW_DIRECT_RENDERING);
     obs_source_process_filter_end(f->context, obs_get_base_effect(OBS_EFFECT_DEFAULT), 0, 0);
+
+    // Hot-swap engine if pending
+    if (f->engineSwapNeeded && !f->pendingEnginePath.empty()) {
+        cudaSetDevice(0); cudaFree(0);
+        destroyTRT(f);
+        if (!loadEngine(f, f->pendingEnginePath.c_str())) {
+            blog(LOG_WARNING, "[YOLO] Engine swap FAILED: %s", f->pendingEnginePath.c_str());
+            f->engineLoaded = false;
+        }
+        f->pendingEnginePath.clear();
+        f->engineSwapNeeded = false;
+    }
 
     if (!f->engineLoaded) return;
     obs_source_t *parent = obs_filter_get_parent(f->context);
@@ -401,36 +473,51 @@ static void filter_video_render(void *data, gs_effect_t *effect) {
         blog(LOG_INFO, "[YOLO] #%d: %d dets | GPU %.2fms | outputBytes=%zu",
              f->inferCount, (int)f->detections.size(), f->gpuLatencyMs, f->outputBytes);
 
-    // Step 8: Aim assist — priority: head (cls=1) > body upper 20% (cls=0)
+    // Step 8: Aim assist
     if (f->aimAssistEnabled && f->mouse.IsLoaded() && !f->detections.empty()) {
-        const Detection *head = nullptr, *body = nullptr;
-        for (const auto &d : f->detections) {
-            if (d.cls == 1 && (!head || d.conf > head->conf)) head = &d;
-            if (d.cls == 0 && (!body || d.conf > body->conf)) body = &d;
-        }
-
+        const Detection *target = nullptr;
         float aimX = 0, aimY = 0;
         const char *what = "none";
 
-        if (head) {
-            aimX = (head->x1 + head->x2) * 0.5f;
-            aimY = (head->y1 + head->y2) * 0.5f;
-            what = "head";
-        } else if (body) {
-            aimX = (body->x1 + body->x2) * 0.5f;
-            aimY = body->y1 + (body->y2 - body->y1) * 0.10f; // upper 20% → center at 10% from top
-            what = "body->head";
+        if (f->headPriority) {
+            // Valorant mode: prefer head, fallback to body upper 20%
+            const Detection *head = nullptr, *body = nullptr;
+            for (const auto &d : f->detections) {
+                if (d.cls == f->headClass && (!head || d.conf > head->conf)) head = &d;
+                if (d.cls == f->bodyClass && (!body || d.conf > body->conf)) body = &d;
+            }
+            if (head) {
+                aimX = (head->x1 + head->x2) * 0.5f;
+                aimY = (head->y1 + head->y2) * 0.5f;
+                target = head; what = "head";
+            } else if (body) {
+                aimX = (body->x1 + body->x2) * 0.5f;
+                aimY = body->y1 + (body->y2 - body->y1) * 0.10f;
+                target = body; what = "body->head";
+            }
+        } else {
+            // BF6 mode: any class, aim at upper 20% of bounding box
+            for (const auto &d : f->detections) {
+                if (!target || d.conf > target->conf) target = &d;
+            }
+            if (target) {
+                aimX = (target->x1 + target->x2) * 0.5f;
+                aimY = target->y1 + (target->y2 - target->y1) * 0.10f;
+                what = "any";
+            }
         }
 
-        if (head || body) {
+        if (target) {
             float scx = w * 0.5f, scy = h * 0.5f;
-            int dx = (int)((aimX - scx) * f->aimSensitivity);
-            int dy = (int)((aimY - scy) * f->aimSensitivity);
-            if (dx != 0 || dy != 0) f->mouse.MoveRelative(dx, dy);
-            if (f->inferCount % 120 == 1)
-                blog(LOG_INFO, "[YOLO] aim[%s]: (%.0f,%.0f) -> (%d,%d) conf=%.2f",
-                     what, aimX, aimY, dx, dy,
-                     head ? head->conf : body->conf);
+            float dist = sqrtf((aimX - scx) * (aimX - scx) + (aimY - scy) * (aimY - scy));
+            if (dist <= f->aimRange) {
+                int dx = (int)((aimX - scx) * f->aimSensitivity);
+                int dy = (int)((aimY - scy) * f->aimSensitivity);
+                if (dx != 0 || dy != 0) f->mouse.MoveRelative(dx, dy);
+                if (f->inferCount % 120 == 1)
+                    blog(LOG_INFO, "[YOLO] aim[%s]: (%.0f,%.0f) dist=%.0f -> (%d,%d) conf=%.2f",
+                         what, aimX, aimY, dist, dx, dy, target->conf);
+            }
         }
     }
 
@@ -468,21 +555,28 @@ static void filter_video_render(void *data, gs_effect_t *effect) {
 // ----------------------------------------------------------------
 static obs_properties_t *filter_get_properties(void *) {
     obs_properties_t *props = obs_properties_create();
-    obs_properties_add_path(props, "engine_path", "Engine Path",
-                            OBS_PATH_FILE, "TensorRT Engine (*.engine)", nullptr);
+
+    obs_property_t *gameList = obs_properties_add_list(props, "engine_path", "Game",
+                                                        OBS_COMBO_TYPE_LIST,
+                                                        OBS_COMBO_FORMAT_STRING);
+    for (const auto &g : kGames)
+        obs_property_list_add_string(gameList, g.name, g.path);
+
     obs_properties_add_float_slider(props, "conf_threshold", "Confidence Threshold",
                                     0.0f, 1.0f, 0.05f);
     obs_properties_add_float_slider(props, "aim_sensitivity", "Aim Smoothing",
                                     0.01f, 1.0f, 0.01f);
     obs_properties_add_bool(props, "aim_assist", "Enable Aim Assist");
+    obs_properties_add_float_slider(props, "aim_range", "Aim Range (px from center)",
+                                    100.0f, 2000.0f, 50.0f);
     return props;
 }
 static void filter_get_defaults(obs_data_t *settings) {
-    obs_data_set_default_string(settings, "engine_path",
-        "D:/code/obs-plugintemplate/data/best_trt.engine");
+    obs_data_set_default_string(settings, "engine_path", kGames[0].path);
     obs_data_set_default_double(settings, "conf_threshold", 0.25);
     obs_data_set_default_double(settings, "aim_sensitivity", 0.15);
     obs_data_set_default_bool(settings, "aim_assist", false);
+    obs_data_set_default_double(settings, "aim_range", 500.0);
 }
 
 static struct obs_source_info yolo_filter = {

@@ -11,6 +11,7 @@
 #include <plugin-support.h>
 
 #include "debug_utils.h"
+#include "mouse_controller.h"
 
 #include <algorithm>
 #include <fstream>
@@ -82,6 +83,11 @@ struct filter_data {
 
     float confThreshold = 0.25f;
     bool engineLoaded = false;
+
+    // Mouse aim assist
+    MouseController mouse;
+    bool aimAssistEnabled = false;
+    float aimSensitivity = 1.0f;
 
     cudaEvent_t evStart = nullptr, evStop = nullptr;
     float gpuLatencyMs = 0.0f;
@@ -216,6 +222,24 @@ static void filter_destroy(void *data) {
 static void filter_update(void *data, obs_data_t *settings) {
     auto *f = (filter_data *)data;
     f->confThreshold = (float)obs_data_get_double(settings, "conf_threshold");
+    f->aimAssistEnabled = obs_data_get_bool(settings, "aim_assist");
+    f->aimSensitivity = (float)obs_data_get_double(settings, "aim_sensitivity");
+
+    // Lazy-load mouse DLL when aim assist is first enabled
+    if (f->aimAssistEnabled && !f->mouse.IsLoaded()) {
+        const char *paths[] = {
+            "D:/steam/steamapps/common/OBS Studio/obs-plugins/64bit/plugintemplate-for-obs/ddll64.dll",
+            "D:/code/obs-plugintemplate/data/ddll64.dll",
+        };
+        char *modPath = obs_module_file("ddll64.dll");
+        if (modPath) { f->mouse.Load(modPath); bfree(modPath); }
+        if (!f->mouse.IsLoaded()) {
+            for (auto p : paths) {
+                if (f->mouse.Load(p)) { blog(LOG_INFO, "[YOLO] Mouse DLL: %s", p); break; }
+            }
+        }
+        if (!f->mouse.IsLoaded()) blog(LOG_WARNING, "[YOLO] Mouse DLL load FAILED");
+    }
 }
 
 // ----------------------------------------------------------------
@@ -377,7 +401,40 @@ static void filter_video_render(void *data, gs_effect_t *effect) {
         blog(LOG_INFO, "[YOLO] #%d: %d dets | GPU %.2fms | outputBytes=%zu",
              f->inferCount, (int)f->detections.size(), f->gpuLatencyMs, f->outputBytes);
 
-    // Step 8: Draw detection boxes
+    // Step 8: Aim assist — priority: head (cls=1) > body upper 20% (cls=0)
+    if (f->aimAssistEnabled && f->mouse.IsLoaded() && !f->detections.empty()) {
+        const Detection *head = nullptr, *body = nullptr;
+        for (const auto &d : f->detections) {
+            if (d.cls == 1 && (!head || d.conf > head->conf)) head = &d;
+            if (d.cls == 0 && (!body || d.conf > body->conf)) body = &d;
+        }
+
+        float aimX = 0, aimY = 0;
+        const char *what = "none";
+
+        if (head) {
+            aimX = (head->x1 + head->x2) * 0.5f;
+            aimY = (head->y1 + head->y2) * 0.5f;
+            what = "head";
+        } else if (body) {
+            aimX = (body->x1 + body->x2) * 0.5f;
+            aimY = body->y1 + (body->y2 - body->y1) * 0.10f; // upper 20% → center at 10% from top
+            what = "body->head";
+        }
+
+        if (head || body) {
+            float scx = w * 0.5f, scy = h * 0.5f;
+            int dx = (int)((aimX - scx) * f->aimSensitivity);
+            int dy = (int)((aimY - scy) * f->aimSensitivity);
+            if (dx != 0 || dy != 0) f->mouse.MoveRelative(dx, dy);
+            if (f->inferCount % 120 == 1)
+                blog(LOG_INFO, "[YOLO] aim[%s]: (%.0f,%.0f) -> (%d,%d) conf=%.2f",
+                     what, aimX, aimY, dx, dy,
+                     head ? head->conf : body->conf);
+        }
+    }
+
+    // Step 9: Draw detection boxes
     if (f->detections.empty()) return;
 
     gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
@@ -415,12 +472,17 @@ static obs_properties_t *filter_get_properties(void *) {
                             OBS_PATH_FILE, "TensorRT Engine (*.engine)", nullptr);
     obs_properties_add_float_slider(props, "conf_threshold", "Confidence Threshold",
                                     0.0f, 1.0f, 0.05f);
+    obs_properties_add_float_slider(props, "aim_sensitivity", "Aim Smoothing",
+                                    0.01f, 1.0f, 0.01f);
+    obs_properties_add_bool(props, "aim_assist", "Enable Aim Assist");
     return props;
 }
 static void filter_get_defaults(obs_data_t *settings) {
     obs_data_set_default_string(settings, "engine_path",
         "D:/code/obs-plugintemplate/data/best_trt.engine");
     obs_data_set_default_double(settings, "conf_threshold", 0.25);
+    obs_data_set_default_double(settings, "aim_sensitivity", 0.15);
+    obs_data_set_default_bool(settings, "aim_assist", false);
 }
 
 static struct obs_source_info yolo_filter = {

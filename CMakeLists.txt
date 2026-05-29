@@ -49,7 +49,7 @@ if(ENABLE_QT)
   )
 endif()
 
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.cpp src/debug_utils.cpp)
+target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.cpp src/debug_utils.cpp src/mouse_controller.cpp)
 
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     _CRT_SECURE_NO_WARNINGS
